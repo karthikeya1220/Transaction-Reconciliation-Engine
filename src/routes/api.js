@@ -5,6 +5,8 @@ const { Router } = require('express');
 const { v4: uuidv4 } = require('uuid');
 
 const config = require('../config');
+const logger = require('../logger');
+const { RUN_STATUS } = require('../constants');
 const { parseCSV } = require('../ingestion/parser');
 const { loadTransactions } = require('../ingestion/loader');
 const { matchTransactions } = require('../matching/engine');
@@ -13,61 +15,95 @@ const ReconciliationRun = require('../models/ReconciliationRun');
 
 const router = Router();
 
-// Paths to the CSV data files (relative to project root)
+/** Absolute paths to the canonical input CSV files. */
 const DATA_DIR = path.resolve(__dirname, '../../data');
 const USER_CSV = path.join(DATA_DIR, 'user_transactions.csv');
 const EXCHANGE_CSV = path.join(DATA_DIR, 'exchange_transactions.csv');
 
 // ---------------------------------------------------------------------------
-// Background reconciliation processor
+// Input validation helpers
 // ---------------------------------------------------------------------------
 
 /**
- * Runs the full reconciliation pipeline in the background (not awaited by the
- * HTTP handler). Updates the ReconciliationRun document throughout.
+ * Validate and coerce a tolerance value from the request body.
+ *
+ * @param {unknown}  value     Raw value from req.body
+ * @param {number}   fallback  Default from config
+ * @param {number}   min       Minimum acceptable value
+ * @param {number}   max       Maximum acceptable value
+ * @param {string}   name      Field name for error messages
+ * @returns {{ ok: true, value: number } | { ok: false, error: string }}
+ */
+function validateTolerance(value, fallback, min, max, name) {
+  if (value === undefined || value === null) return { ok: true, value: fallback };
+  const n = Number(value);
+  if (isNaN(n)) return { ok: false, error: `${name} must be a number` };
+  if (n < min || n > max) return { ok: false, error: `${name} must be between ${min} and ${max}` };
+  return { ok: true, value: n };
+}
+
+// ---------------------------------------------------------------------------
+// Background reconciliation pipeline
+// ---------------------------------------------------------------------------
+
+/**
+ * Execute the full reconciliation pipeline for a given run.
+ *
+ * Intentionally separated from the route handler so it can be called
+ * fire-and-forget without blocking the HTTP response. Updates the
+ * ReconciliationRun document at each lifecycle transition.
  *
  * @param {string} runId
  * @param {{ timestampToleranceSecs: number, quantityTolerancePct: number }} runConfig
  */
 async function runReconciliation(runId, runConfig) {
-  try {
-    await ReconciliationRun.findOneAndUpdate(
-      { runId },
-      { status: 'running' }
-    );
+  const log = (msg, meta = {}) => logger.info(msg, { runId, ...meta });
+  const logErr = (msg, meta = {}) => logger.error(msg, { runId, ...meta });
 
-    // 1. Parse both CSVs
+  try {
+    await ReconciliationRun.findOneAndUpdate({ runId }, { status: RUN_STATUS.RUNNING });
+    log('Reconciliation started');
+
+    // Step 1 — Parse CSVs
     const userResult = parseCSV(USER_CSV, 'user');
     const exchangeResult = parseCSV(EXCHANGE_CSV, 'exchange');
+    log('CSVs parsed', {
+      user: userResult.stats,
+      exchange: exchangeResult.stats,
+    });
 
-    console.log(`[${runId}] Parsed: user=${userResult.stats.total} rows (${userResult.stats.flagged} flagged), exchange=${exchangeResult.stats.total} rows (${exchangeResult.stats.flagged} flagged)`);
-
-    // 2. Load into MongoDB
+    // Step 2 — Load into MongoDB (parallel)
     const [userLoad, exchangeLoad] = await Promise.all([
       loadTransactions(userResult.rows, runId, 'user'),
       loadTransactions(exchangeResult.rows, runId, 'exchange'),
     ]);
+    log('Transactions inserted', { user: userLoad.inserted, exchange: exchangeLoad.inserted });
+    if (userLoad.errors.length || exchangeLoad.errors.length) {
+      logger.warn('Some documents failed to insert', {
+        runId,
+        userErrors: userLoad.errors.length,
+        exchangeErrors: exchangeLoad.errors.length,
+      });
+    }
 
-    console.log(`[${runId}] Inserted: user=${userLoad.inserted}, exchange=${exchangeLoad.inserted}`);
-
-    // 3. Run matching engine
+    // Step 3 — Match
     const results = await matchTransactions(runId, runConfig);
+    log('Matching complete', {
+      matched: results.matched.length,
+      conflicting: results.conflicting.length,
+      unmatchedUser: results.unmatchedUser.length,
+      unmatchedExchange: results.unmatchedExchange.length,
+    });
 
-    console.log(`[${runId}] Matching complete: matched=${results.matched.length}, conflicting=${results.conflicting.length}, unmatchedUser=${results.unmatchedUser.length}, unmatchedExchange=${results.unmatchedExchange.length}`);
-
-    // 4. Generate CSV report
+    // Step 4 — Generate CSV report
     const reportPath = await generateReport(runId, results);
+    log('Report written', { reportPath });
 
-    console.log(`[${runId}] Report written to ${reportPath}`);
-
-    // 5. Update run document with final summary
-    const totalFlagged =
-      userResult.stats.flagged + exchangeResult.stats.flagged;
-
+    // Step 5 — Persist final state
     await ReconciliationRun.findOneAndUpdate(
       { runId },
       {
-        status: 'done',
+        status: RUN_STATUS.DONE,
         reportPath,
         completedAt: new Date(),
         summary: {
@@ -75,16 +111,19 @@ async function runReconciliation(runId, runConfig) {
           conflicting: results.conflicting.length,
           unmatchedUser: results.unmatchedUser.length,
           unmatchedExchange: results.unmatchedExchange.length,
-          totalFlagged,
+          totalFlagged: userResult.stats.flagged + exchangeResult.stats.flagged,
         },
       }
     );
+    log('Run completed successfully');
   } catch (err) {
-    console.error(`[${runId}] Reconciliation failed:`, err);
+    logger.error('Reconciliation pipeline failed', { runId, error: err.message, stack: err.stack });
     await ReconciliationRun.findOneAndUpdate(
       { runId },
-      { status: 'failed', errorMessage: err.message }
-    ).catch(() => {});
+      { status: RUN_STATUS.FAILED, errorMessage: err.message }
+    ).catch((updateErr) => {
+      logger.error('Failed to persist error state', { runId, error: updateErr.message });
+    });
   }
 }
 
@@ -130,49 +169,43 @@ async function runReconciliation(runId, runConfig) {
  *                 status:
  *                   type: string
  *                   example: "running"
+ *       400:
+ *         description: Invalid tolerance values
  *       500:
  *         description: Server error
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 error:
- *                   type: string
- *                   example: "Failed to start reconciliation run"
- *                 detail:
- *                   type: string
- *                   example: "Error message details"
  */
 router.post('/reconcile', async (req, res) => {
   try {
-    const runId = uuidv4();
+    // Validate tolerance overrides from request body
+    const tsResult = validateTolerance(
+      req.body?.timestampToleranceSecs,
+      config.timestampToleranceSecs,
+      0, 86400, 'timestampToleranceSecs'
+    );
+    const qResult = validateTolerance(
+      req.body?.quantityTolerancePct,
+      config.quantityTolerancePct,
+      0, 1, 'quantityTolerancePct'
+    );
 
-    // Merge request-body overrides with env defaults (body takes precedence)
+    if (!tsResult.ok) return res.status(400).json({ error: tsResult.error });
+    if (!qResult.ok) return res.status(400).json({ error: qResult.error });
+
+    const runId = uuidv4();
     const runConfig = {
-      timestampToleranceSecs:
-        req.body.timestampToleranceSecs !== undefined
-          ? Number(req.body.timestampToleranceSecs)
-          : config.timestampToleranceSecs,
-      quantityTolerancePct:
-        req.body.quantityTolerancePct !== undefined
-          ? Number(req.body.quantityTolerancePct)
-          : config.quantityTolerancePct,
+      timestampToleranceSecs: tsResult.value,
+      quantityTolerancePct: qResult.value,
     };
 
-    // Create the run record in a 'pending' state
-    await ReconciliationRun.create({
-      runId,
-      status: 'pending',
-      config: runConfig,
-    });
+    await ReconciliationRun.create({ runId, status: RUN_STATUS.PENDING, config: runConfig });
+    logger.info('Reconciliation run created', { runId, config: runConfig });
 
     // Fire-and-forget — do NOT await
     runReconciliation(runId, runConfig);
 
     return res.status(202).json({ runId, status: 'running' });
   } catch (err) {
-    console.error('POST /reconcile error:', err);
+    logger.error('POST /reconcile failed', { error: err.message });
     return res.status(500).json({ error: 'Failed to start reconciliation run', detail: err.message });
   }
 });
@@ -218,30 +251,8 @@ router.post('/reconcile', async (req, res) => {
  *                     $ref: '#/components/schemas/ReconciliationRow'
  *       202:
  *         description: Reconciliation run is not complete yet
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 runId:
- *                   type: string
- *                   format: uuid
- *                 status:
- *                   type: string
- *                   example: "running"
- *                 message:
- *                   type: string
- *                   example: "Reconciliation is not yet complete."
  *       404:
  *         description: Run or report file not found
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 error:
- *                   type: string
- *                   example: "Run not found: 550e8400-e29b-41d4-a716-446655440000"
  *       500:
  *         description: Server error
  */
@@ -250,11 +261,9 @@ router.get('/report/:runId', async (req, res) => {
     const { runId } = req.params;
     const run = await ReconciliationRun.findOne({ runId }).lean();
 
-    if (!run) {
-      return res.status(404).json({ error: `Run not found: ${runId}` });
-    }
+    if (!run) return res.status(404).json({ error: `Run not found: ${runId}` });
 
-    if (run.status !== 'done') {
+    if (run.status !== RUN_STATUS.DONE) {
       return res.status(202).json({
         runId,
         status: run.status,
@@ -263,19 +272,17 @@ router.get('/report/:runId', async (req, res) => {
     }
 
     const rows = readReport(runId);
-    if (!rows) {
-      return res.status(404).json({ error: `Report file not found for run: ${runId}` });
-    }
+    if (!rows) return res.status(404).json({ error: `Report file not found for run: ${runId}` });
 
     return res.status(200).json({ runId, total: rows.length, rows });
   } catch (err) {
-    console.error('GET /report/:runId error:', err);
+    logger.error('GET /report/:runId failed', { error: err.message });
     return res.status(500).json({ error: 'Failed to fetch report', detail: err.message });
   }
 });
 
 // ---------------------------------------------------------------------------
-// GET /report/:runId/summary — counts only
+// GET /report/:runId/summary — counts and metadata only
 // ---------------------------------------------------------------------------
 
 /**
@@ -343,10 +350,13 @@ router.get('/report/:runId', async (req, res) => {
  *                   type: string
  *                   format: date-time
  *                   nullable: true
+ *                 durationMs:
+ *                   type: integer
+ *                   nullable: true
+ *                   description: Elapsed time in milliseconds from creation to completion
  *                 errorMessage:
  *                   type: string
  *                   nullable: true
- *                   example: null
  *       404:
  *         description: Run not found
  *       500:
@@ -355,11 +365,10 @@ router.get('/report/:runId', async (req, res) => {
 router.get('/report/:runId/summary', async (req, res) => {
   try {
     const { runId } = req.params;
-    const run = await ReconciliationRun.findOne({ runId }).lean();
+    // Use the non-lean form here to access the durationMs virtual
+    const run = await ReconciliationRun.findOne({ runId });
 
-    if (!run) {
-      return res.status(404).json({ error: `Run not found: ${runId}` });
-    }
+    if (!run) return res.status(404).json({ error: `Run not found: ${runId}` });
 
     return res.status(200).json({
       runId: run.runId,
@@ -367,11 +376,12 @@ router.get('/report/:runId/summary', async (req, res) => {
       config: run.config,
       summary: run.summary,
       createdAt: run.createdAt,
-      completedAt: run.completedAt,
-      errorMessage: run.errorMessage || null,
+      completedAt: run.completedAt ?? null,
+      durationMs: run.durationMs ?? null,
+      errorMessage: run.errorMessage ?? null,
     });
   } catch (err) {
-    console.error('GET /report/:runId/summary error:', err);
+    logger.error('GET /report/:runId/summary failed', { error: err.message });
     return res.status(500).json({ error: 'Failed to fetch summary', detail: err.message });
   }
 });
@@ -426,11 +436,9 @@ router.get('/report/:runId/unmatched', async (req, res) => {
     const { runId } = req.params;
     const run = await ReconciliationRun.findOne({ runId }).lean();
 
-    if (!run) {
-      return res.status(404).json({ error: `Run not found: ${runId}` });
-    }
+    if (!run) return res.status(404).json({ error: `Run not found: ${runId}` });
 
-    if (run.status !== 'done') {
+    if (run.status !== RUN_STATUS.DONE) {
       return res.status(202).json({
         runId,
         status: run.status,
@@ -439,27 +447,21 @@ router.get('/report/:runId/unmatched', async (req, res) => {
     }
 
     const rows = readReport(runId);
-    if (!rows) {
-      return res.status(404).json({ error: `Report file not found for run: ${runId}` });
-    }
+    if (!rows) return res.status(404).json({ error: `Report file not found for run: ${runId}` });
 
     const unmatched = rows.filter(
       (r) => r.category === 'UNMATCHED_USER' || r.category === 'UNMATCHED_EXCHANGE'
     );
 
-    return res.status(200).json({
-      runId,
-      unmatchedCount: unmatched.length,
-      rows: unmatched,
-    });
+    return res.status(200).json({ runId, unmatchedCount: unmatched.length, rows: unmatched });
   } catch (err) {
-    console.error('GET /report/:runId/unmatched error:', err);
+    logger.error('GET /report/:runId/unmatched failed', { error: err.message });
     return res.status(500).json({ error: 'Failed to fetch unmatched rows', detail: err.message });
   }
 });
 
 // ---------------------------------------------------------------------------
-// OpenAPI Schema Components
+// OpenAPI shared component schemas
 // ---------------------------------------------------------------------------
 
 /**
@@ -472,49 +474,32 @@ router.get('/report/:runId/unmatched', async (req, res) => {
  *         category:
  *           type: string
  *           enum: [MATCHED, CONFLICTING, UNMATCHED_USER, UNMATCHED_EXCHANGE]
- *           example: "MATCHED"
  *         reason:
  *           type: string
- *           description: Match explanation or mismatch reasoning
- *           example: "Exact Match"
  *         matchDetails:
  *           type: string
- *           description: Additional matching insights
- *           example: "matched with exchange txId: tx-998"
  *         user_txId:
  *           type: string
- *           example: "tx-user-001"
  *         user_timestamp:
  *           type: string
  *           format: date-time
- *           example: "2026-05-24T11:00:00.000Z"
  *         user_type:
  *           type: string
- *           enum: [deposit, withdrawal, buy, sell]
- *           example: "buy"
  *         user_asset:
  *           type: string
- *           example: "BTC"
  *         user_quantity:
  *           type: number
- *           example: 0.125
  *         exchange_txId:
  *           type: string
- *           example: "tx-exch-001"
  *         exchange_timestamp:
  *           type: string
  *           format: date-time
- *           example: "2026-05-24T11:02:15.000Z"
  *         exchange_type:
  *           type: string
- *           enum: [deposit, withdrawal, buy, sell]
- *           example: "buy"
  *         exchange_asset:
  *           type: string
- *           example: "BTC"
  *         exchange_quantity:
  *           type: number
- *           example: 0.125
  */
 
 module.exports = router;
