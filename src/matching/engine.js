@@ -1,6 +1,7 @@
 'use strict';
 
 const Transaction = require('../models/Transaction');
+const { REASON } = require('../constants');
 
 // ---------------------------------------------------------------------------
 // Helper predicates
@@ -8,10 +9,13 @@ const Transaction = require('../models/Transaction');
 
 /**
  * Returns true if two transaction types represent the same real-world event.
- * TRANSFER_IN (exchange perspective) ↔ TRANSFER_OUT (user perspective).
  *
- * @param {string|null} typeA
- * @param {string|null} typeB
+ * TRANSFER_IN (exchange perspective) and TRANSFER_OUT (user perspective)
+ * are treated as equivalent because a single crypto transfer appears as
+ * outbound on one side and inbound on the other.
+ *
+ * @param {string | null} typeA
+ * @param {string | null} typeB
  * @returns {boolean}
  */
 function typesMatch(typeA, typeB) {
@@ -19,37 +23,37 @@ function typesMatch(typeA, typeB) {
   const a = String(typeA).toUpperCase();
   const b = String(typeB).toUpperCase();
   if (a === b) return true;
-  if (
+  return (
     (a === 'TRANSFER_IN' && b === 'TRANSFER_OUT') ||
     (a === 'TRANSFER_OUT' && b === 'TRANSFER_IN')
-  ) {
-    return true;
-  }
-  return false;
+  );
 }
 
 /**
- * Returns true if two quantities are within the configured tolerance percentage.
+ * Returns true if two quantities are within the configured tolerance.
  *
- * @param {number|null} qA
- * @param {number|null} qB
- * @param {number}      tolerancePct  e.g. 0.01 = 1%
+ * Uses relative difference: |a - b| / max(|a|, |b|) <= tolerancePct.
+ * Special case: both zero is always true.
+ *
+ * @param {number | null} qA
+ * @param {number | null} qB
+ * @param {number}        tolerancePct  e.g. 0.01 for 1%
  * @returns {boolean}
  */
 function quantitiesMatch(qA, qB, tolerancePct) {
-  if (qA === null || qA === undefined || qB === null || qB === undefined) return false;
+  if (qA == null || qB == null) return false;
   if (qA === 0 && qB === 0) return true;
-  const maxVal = Math.max(Math.abs(qA), Math.abs(qB));
-  if (maxVal === 0) return true;
-  return Math.abs(qA - qB) / maxVal <= tolerancePct;
+  const denominator = Math.max(Math.abs(qA), Math.abs(qB));
+  if (denominator === 0) return true;
+  return Math.abs(qA - qB) / denominator <= tolerancePct;
 }
 
 /**
- * Returns true if two timestamps are within the configured tolerance in seconds.
+ * Returns true if two timestamps differ by at most toleranceSecs seconds.
  *
- * @param {Date|null} tsA
- * @param {Date|null} tsB
- * @param {number}    toleranceSecs
+ * @param {Date | null} tsA
+ * @param {Date | null} tsB
+ * @param {number}      toleranceSecs
  * @returns {boolean}
  */
 function timestampsMatch(tsA, tsB, toleranceSecs) {
@@ -60,10 +64,10 @@ function timestampsMatch(tsA, tsB, toleranceSecs) {
 
 /**
  * Returns true if two asset strings are equal (case-insensitive).
- * Assets should already be normalized by the parser.
+ * Assets are already normalised to tickers by the parser.
  *
- * @param {string|null} a
- * @param {string|null} b
+ * @param {string | null} a
+ * @param {string | null} b
  * @returns {boolean}
  */
 function assetsMatch(a, b) {
@@ -72,10 +76,10 @@ function assetsMatch(a, b) {
 }
 
 /**
- * Compute absolute timestamp delta in milliseconds between two transactions.
+ * Returns the absolute timestamp delta in milliseconds between two transactions.
  *
- * @param {object} txA
- * @param {object} txB
+ * @param {{ timestamp: Date }} txA
+ * @param {{ timestamp: Date }} txB
  * @returns {number}
  */
 function tsDeltaMs(txA, txB) {
@@ -83,70 +87,48 @@ function tsDeltaMs(txA, txB) {
 }
 
 // ---------------------------------------------------------------------------
-// Main matching engine
+// Pass 1 — Exact txId match
 // ---------------------------------------------------------------------------
 
 /**
- * Two-pass matching algorithm:
- *   Pass 1 — Exact txId match
- *   Pass 2 — Fuzzy proximity match (asset + type + timestamp + quantity)
- *
- * @param {string} runId
+ * @param {object[]} userTxs
+ * @param {Map<string, object[]>} exchangeByTxId
+ * @param {Set<string>} matchedUserIds
+ * @param {Set<string>} matchedExchangeIds
  * @param {{ timestampToleranceSecs: number, quantityTolerancePct: number }} config
- * @returns {{ matched: object[], conflicting: object[], unmatchedUser: object[], unmatchedExchange: object[] }}
+ * @returns {{ matched: object[], conflicting: object[] }}
  */
-async function matchTransactions(runId, config) {
-  const { timestampToleranceSecs, quantityTolerancePct } = config;
-
-  // Load all transactions for this run from MongoDB (lean for performance)
-  const userTxs = await Transaction.find({ runId, source: 'user' }).lean();
-  const exchangeTxs = await Transaction.find({ runId, source: 'exchange' }).lean();
-
+function runPass1(userTxs, exchangeByTxId, matchedUserIds, matchedExchangeIds, config) {
   const matched = [];
   const conflicting = [];
-  const unmatchedUser = [];
-  const unmatchedExchange = [];
+  const { timestampToleranceSecs, quantityTolerancePct } = config;
 
-  // Track matched MongoDB _id strings to avoid double-matching
-  const matchedUserIds = new Set();
-  const matchedExchangeIds = new Set();
-
-  // Build an index of exchange txs by txId for O(1) Pass 1 lookups
-  const exchangeByTxId = new Map();
-  for (const ex of exchangeTxs) {
-    if (ex.txId) {
-      if (!exchangeByTxId.has(ex.txId)) {
-        exchangeByTxId.set(ex.txId, []);
-      }
-      exchangeByTxId.get(ex.txId).push(ex);
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // PASS 1 — Exact txId match
-  // -------------------------------------------------------------------------
   for (const user of userTxs) {
-    if (!user.txId) continue; // no txId → skip to Pass 2
+    if (!user.txId) continue;
 
-    const candidates = exchangeByTxId.get(user.txId) || [];
-    // Find first unmatched exchange tx with this txId
-    const match = candidates.find((ex) => !matchedExchangeIds.has(String(ex._id)));
+    const candidates = exchangeByTxId.get(user.txId) ?? [];
+    const counterpart = candidates.find((ex) => !matchedExchangeIds.has(String(ex._id)));
+    if (!counterpart) continue;
 
-    if (!match) continue;
+    const qOk = quantitiesMatch(user.quantity, counterpart.quantity, quantityTolerancePct);
+    const tsOk = timestampsMatch(user.timestamp, counterpart.timestamp, timestampToleranceSecs);
+    const discrepancies = [];
 
-    // Check tolerances to decide matched vs conflicting
-    const qOk = quantitiesMatch(user.quantity, match.quantity, quantityTolerancePct);
-    const tsOk = timestampsMatch(user.timestamp, match.timestamp, timestampToleranceSecs);
-
-    const mismatchDetails = [];
-    if (!qOk) mismatchDetails.push(`quantity mismatch: user=${user.quantity} exchange=${match.quantity}`);
-    if (!tsOk) mismatchDetails.push(`timestamp mismatch: delta=${Math.abs(new Date(user.timestamp) - new Date(match.timestamp)) / 1000}s`);
+    if (!qOk) {
+      discrepancies.push(
+        `quantity mismatch: user=${user.quantity} exchange=${counterpart.quantity}`
+      );
+    }
+    if (!tsOk) {
+      const deltaS = (Math.abs(new Date(user.timestamp) - new Date(counterpart.timestamp)) / 1000).toFixed(1);
+      discrepancies.push(`timestamp mismatch: delta=${deltaS}s`);
+    }
 
     const record = {
       userTx: user,
-      exchangeTx: match,
-      reason: qOk && tsOk ? 'EXACT_TX_ID_MATCH' : 'EXACT_TX_ID_MATCH_WITH_DISCREPANCY',
-      matchDetails: mismatchDetails.length ? mismatchDetails.join('; ') : 'All fields within tolerance',
+      exchangeTx: counterpart,
+      reason: qOk && tsOk ? REASON.EXACT_MATCH : REASON.EXACT_MATCH_WITH_DISCREPANCY,
+      matchDetails: discrepancies.length > 0 ? discrepancies.join('; ') : 'All fields within tolerance',
     };
 
     if (qOk && tsOk) {
@@ -156,23 +138,38 @@ async function matchTransactions(runId, config) {
     }
 
     matchedUserIds.add(String(user._id));
-    matchedExchangeIds.add(String(match._id));
+    matchedExchangeIds.add(String(counterpart._id));
   }
 
-  // -------------------------------------------------------------------------
-  // PASS 2 — Fuzzy proximity match (unmatched transactions only)
-  // -------------------------------------------------------------------------
+  return { matched, conflicting };
+}
+
+// ---------------------------------------------------------------------------
+// Pass 2 — Fuzzy proximity match
+// ---------------------------------------------------------------------------
+
+/**
+ * @param {object[]} userTxs
+ * @param {object[]} exchangeTxs
+ * @param {Set<string>} matchedUserIds
+ * @param {Set<string>} matchedExchangeIds
+ * @param {{ timestampToleranceSecs: number, quantityTolerancePct: number }} config
+ * @returns {object[]} matched records
+ */
+function runPass2(userTxs, exchangeTxs, matchedUserIds, matchedExchangeIds, config) {
+  const matched = [];
+  const { timestampToleranceSecs, quantityTolerancePct } = config;
+
   const remainingUsers = userTxs.filter((u) => !matchedUserIds.has(String(u._id)));
   const remainingExchange = exchangeTxs.filter((ex) => !matchedExchangeIds.has(String(ex._id)));
 
   for (const user of remainingUsers) {
-    // Must have valid timestamp + quantity + asset + type for fuzzy matching
-    if (!user.timestamp || user.quantity === null || !user.asset || !user.type) continue;
+    // A row must have all four fields to participate in fuzzy matching
+    if (!user.timestamp || user.quantity == null || !user.asset || !user.type) continue;
 
-    // Find all exchange txs that satisfy all fuzzy criteria
     const candidates = remainingExchange.filter((ex) => {
       if (matchedExchangeIds.has(String(ex._id))) return false;
-      if (!ex.timestamp || ex.quantity === null || !ex.asset || !ex.type) return false;
+      if (!ex.timestamp || ex.quantity == null || !ex.asset || !ex.type) return false;
       return (
         assetsMatch(user.asset, ex.asset) &&
         typesMatch(user.type, ex.type) &&
@@ -183,45 +180,79 @@ async function matchTransactions(runId, config) {
 
     if (candidates.length === 0) continue;
 
-    // Tie-break: pick candidate with smallest timestamp delta
+    // Tie-break by smallest timestamp delta — most temporally proximate is the safest choice
     candidates.sort((a, b) => tsDeltaMs(user, a) - tsDeltaMs(user, b));
     const best = candidates[0];
 
     matched.push({
       userTx: user,
       exchangeTx: best,
-      reason: 'FUZZY_PROXIMITY_MATCH',
-      matchDetails: `timestamp delta=${(tsDeltaMs(user, best) / 1000).toFixed(1)}s; quantity delta=${Math.abs(user.quantity - best.quantity).toFixed(8)}`,
+      reason: REASON.FUZZY_MATCH,
+      matchDetails: [
+        `timestamp delta=${(tsDeltaMs(user, best) / 1000).toFixed(1)}s`,
+        `quantity delta=${Math.abs(user.quantity - best.quantity).toFixed(8)}`,
+      ].join('; '),
     });
 
     matchedUserIds.add(String(user._id));
     matchedExchangeIds.add(String(best._id));
   }
 
-  // -------------------------------------------------------------------------
-  // Collect remaining unmatched
-  // -------------------------------------------------------------------------
-  for (const user of userTxs) {
-    if (!matchedUserIds.has(String(user._id))) {
-      unmatchedUser.push({
-        userTx: user,
-        exchangeTx: null,
-        reason: 'NO_MATCHING_EXCHANGE_TRANSACTION',
-        matchDetails: '',
-      });
+  return matched;
+}
+
+// ---------------------------------------------------------------------------
+// Main engine
+// ---------------------------------------------------------------------------
+
+/**
+ * Run the two-pass reconciliation algorithm against transactions stored in
+ * MongoDB for the given runId.
+ *
+ * @param {string} runId
+ * @param {{ timestampToleranceSecs: number, quantityTolerancePct: number }} config
+ * @returns {Promise<{
+ *   matched: object[],
+ *   conflicting: object[],
+ *   unmatchedUser: object[],
+ *   unmatchedExchange: object[]
+ * }>}
+ */
+async function matchTransactions(runId, config) {
+  const [userTxs, exchangeTxs] = await Promise.all([
+    Transaction.find({ runId, source: 'user' }).lean(),
+    Transaction.find({ runId, source: 'exchange' }).lean(),
+  ]);
+
+  const matchedUserIds = new Set();
+  const matchedExchangeIds = new Set();
+
+  // Build an O(1) lookup index for Pass 1
+  const exchangeByTxId = new Map();
+  for (const ex of exchangeTxs) {
+    if (ex.txId) {
+      if (!exchangeByTxId.has(ex.txId)) exchangeByTxId.set(ex.txId, []);
+      exchangeByTxId.get(ex.txId).push(ex);
     }
   }
 
-  for (const ex of exchangeTxs) {
-    if (!matchedExchangeIds.has(String(ex._id))) {
-      unmatchedExchange.push({
-        userTx: null,
-        exchangeTx: ex,
-        reason: 'NO_MATCHING_USER_TRANSACTION',
-        matchDetails: '',
-      });
-    }
-  }
+  const { matched: p1Matched, conflicting } = runPass1(
+    userTxs, exchangeByTxId, matchedUserIds, matchedExchangeIds, config
+  );
+
+  const p2Matched = runPass2(
+    userTxs, exchangeTxs, matchedUserIds, matchedExchangeIds, config
+  );
+
+  const matched = [...p1Matched, ...p2Matched];
+
+  const unmatchedUser = userTxs
+    .filter((u) => !matchedUserIds.has(String(u._id)))
+    .map((userTx) => ({ userTx, exchangeTx: null, reason: REASON.NO_MATCH_USER, matchDetails: '' }));
+
+  const unmatchedExchange = exchangeTxs
+    .filter((ex) => !matchedExchangeIds.has(String(ex._id)))
+    .map((exchangeTx) => ({ userTx: null, exchangeTx, reason: REASON.NO_MATCH_EXCHANGE, matchDetails: '' }));
 
   return { matched, conflicting, unmatchedUser, unmatchedExchange };
 }
