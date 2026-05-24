@@ -1,0 +1,464 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Crypto Transaction Reconciliation Engine API",
+    "version": "1.0.0",
+    "description": "RESTful API documentation for the crypto transaction reconciliation engine. Coordinates ingestion of user/exchange CSV files, execution of matching rules, and status reporting."
+  },
+  "servers": [
+    {
+      "url": "http://localhost:3000",
+      "description": "Development Server"
+    }
+  ],
+  "paths": {
+    "/reconcile": {
+      "post": {
+        "summary": "Trigger a new reconciliation run",
+        "description": "Starts a background reconciliation process between user and exchange transactions.",
+        "tags": [
+          "Reconciliation"
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "timestampToleranceSecs": {
+                    "type": "integer",
+                    "description": "Time difference tolerance in seconds for transactions to match",
+                    "example": 300
+                  },
+                  "quantityTolerancePct": {
+                    "type": "number",
+                    "description": "Percentage tolerance for transaction quantities to match (e.g. 0.01 for 1%)",
+                    "example": 0.01
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Reconciliation run accepted and started in background",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "runId": {
+                      "type": "string",
+                      "format": "uuid",
+                      "example": "550e8400-e29b-41d4-a716-446655440000"
+                    },
+                    "status": {
+                      "type": "string",
+                      "example": "running"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "example": "Failed to start reconciliation run"
+                    },
+                    "detail": {
+                      "type": "string",
+                      "example": "Error message details"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/report/{runId}": {
+      "get": {
+        "summary": "Fetch full reconciliation report",
+        "description": "Retrieves the detailed reconciliation report containing matched, conflicting, and unmatched transaction records in JSON format.",
+        "tags": [
+          "Reports"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "runId",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Unique reconciliation run ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Full report fetched successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "runId": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "total": {
+                      "type": "integer",
+                      "description": "Total number of rows in the report",
+                      "example": 100
+                    },
+                    "rows": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ReconciliationRow"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Reconciliation run is not complete yet",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "runId": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "status": {
+                      "type": "string",
+                      "example": "running"
+                    },
+                    "message": {
+                      "type": "string",
+                      "example": "Reconciliation is not yet complete."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Run or report file not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "example": "Run not found: 550e8400-e29b-41d4-a716-446655440000"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/report/{runId}/summary": {
+      "get": {
+        "summary": "Fetch reconciliation summary",
+        "description": "Retrieves metadata, config settings, and matching statistics for a reconciliation run.",
+        "tags": [
+          "Reports"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "runId",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Unique reconciliation run ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Summary fetched successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "runId": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "pending",
+                        "running",
+                        "done",
+                        "failed"
+                      ],
+                      "example": "done"
+                    },
+                    "config": {
+                      "type": "object",
+                      "properties": {
+                        "timestampToleranceSecs": {
+                          "type": "integer",
+                          "example": 300
+                        },
+                        "quantityTolerancePct": {
+                          "type": "number",
+                          "example": 0.01
+                        }
+                      }
+                    },
+                    "summary": {
+                      "type": "object",
+                      "properties": {
+                        "matched": {
+                          "type": "integer",
+                          "example": 85
+                        },
+                        "conflicting": {
+                          "type": "integer",
+                          "example": 5
+                        },
+                        "unmatchedUser": {
+                          "type": "integer",
+                          "example": 10
+                        },
+                        "unmatchedExchange": {
+                          "type": "integer",
+                          "example": 12
+                        },
+                        "totalFlagged": {
+                          "type": "integer",
+                          "example": 3
+                        }
+                      }
+                    },
+                    "createdAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "completedAt": {
+                      "type": "string",
+                      "format": "date-time",
+                      "nullable": true
+                    },
+                    "errorMessage": {
+                      "type": "string",
+                      "nullable": true,
+                      "example": null
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/report/{runId}/unmatched": {
+      "get": {
+        "summary": "Fetch unmatched records only",
+        "description": "Filter and return only the unmatched user and exchange records from the reconciliation report.",
+        "tags": [
+          "Reports"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "runId",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Unique reconciliation run ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Unmatched records fetched successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "runId": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "unmatchedCount": {
+                      "type": "integer",
+                      "example": 22
+                    },
+                    "rows": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ReconciliationRow"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Reconciliation run is not complete yet"
+          },
+          "404": {
+            "description": "Run or report not found"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "API health and database connection check",
+        "description": "Returns the status of the engine and the MongoDB database connection ready state.",
+        "tags": [
+          "System"
+        ],
+        "responses": {
+          "200": {
+            "description": "Service is healthy and database is reachable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "dbState": {
+                      "type": "integer",
+                      "description": "Mongoose connection readyState (0 = disconnected, 1 = connected, 2 = connecting, 3 = disconnecting)",
+                      "example": 1
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ReconciliationRow": {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "enum": [
+              "MATCHED",
+              "CONFLICTING",
+              "UNMATCHED_USER",
+              "UNMATCHED_EXCHANGE"
+            ],
+            "example": "MATCHED"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Match explanation or mismatch reasoning",
+            "example": "Exact Match"
+          },
+          "matchDetails": {
+            "type": "string",
+            "description": "Additional matching insights",
+            "example": "matched with exchange txId: tx-998"
+          },
+          "user_txId": {
+            "type": "string",
+            "example": "tx-user-001"
+          },
+          "user_timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-05-24T11:00:00.000Z"
+          },
+          "user_type": {
+            "type": "string",
+            "enum": [
+              "deposit",
+              "withdrawal",
+              "buy",
+              "sell"
+            ],
+            "example": "buy"
+          },
+          "user_asset": {
+            "type": "string",
+            "example": "BTC"
+          },
+          "user_quantity": {
+            "type": "number",
+            "example": 0.125
+          },
+          "exchange_txId": {
+            "type": "string",
+            "example": "tx-exch-001"
+          },
+          "exchange_timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-05-24T11:02:15.000Z"
+          },
+          "exchange_type": {
+            "type": "string",
+            "enum": [
+              "deposit",
+              "withdrawal",
+              "buy",
+              "sell"
+            ],
+            "example": "buy"
+          },
+          "exchange_asset": {
+            "type": "string",
+            "example": "BTC"
+          },
+          "exchange_quantity": {
+            "type": "number",
+            "example": 0.125
+          }
+        }
+      }
+    }
+  },
+  "tags": []
+}
