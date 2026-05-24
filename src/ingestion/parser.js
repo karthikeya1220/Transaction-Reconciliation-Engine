@@ -1,14 +1,16 @@
 'use strict';
 
 const fs = require('fs');
-const path = require('path');
 const { parse } = require('csv-parse/sync');
+const { DATA_QUALITY_ISSUE } = require('../constants');
 
 /**
- * Asset alias map — normalized to standard ticker symbols at parse time.
+ * Asset alias map — full names normalised to standard ticker symbols at parse time.
  * Keys are lowercase for case-insensitive lookup.
+ *
+ * @type {Record<string, string>}
  */
-const ASSET_ALIASES = {
+const ASSET_ALIASES = Object.freeze({
   bitcoin: 'BTC',
   ethereum: 'ETH',
   solana: 'SOL',
@@ -18,41 +20,93 @@ const ASSET_ALIASES = {
   litecoin: 'LTC',
   polkadot: 'DOT',
   chainlink: 'LINK',
-};
+  avalanche: 'AVAX',
+  polygon: 'MATIC',
+  shiba: 'SHIB',
+});
 
 /**
- * Known canonical tickers (no alias needed — accepted as-is, uppercased).
+ * Known canonical tickers (accepted as-is after uppercasing, no alias needed).
+ *
+ * @type {Set<string>}
  */
 const KNOWN_TICKERS = new Set([
-  'BTC', 'ETH', 'SOL', 'DOGE', 'ADA', 'XRP', 'LTC', 'DOT', 'LINK', 'USDT', 'USDC', 'BNB',
+  'BTC', 'ETH', 'SOL', 'DOGE', 'ADA', 'XRP', 'LTC', 'DOT', 'LINK',
+  'USDT', 'USDC', 'BNB', 'AVAX', 'MATIC', 'SHIB',
 ]);
 
+// ---------------------------------------------------------------------------
+// Field extractors
+//
+// CSV column names vary between data providers. Each extractor checks several
+// plausible header names in priority order and returns the first non-empty
+// value found.
+// ---------------------------------------------------------------------------
+
 /**
- * Attempt to parse a raw timestamp string into a JS Date.
- * Tries: ISO 8601, unix milliseconds (numeric), DD/MM/YYYY, MM/DD/YYYY, MM-DD-YYYY.
+ * @param {Record<string, string>} record
+ * @returns {string}
+ */
+const extractTxId = (record) =>
+  record.txId ?? record.tx_id ?? record.transactionId ?? record.transaction_id ?? '';
+
+/**
+ * @param {Record<string, string>} record
+ * @returns {string}
+ */
+const extractTimestamp = (record) =>
+  record.timestamp ?? record.date ?? record.time ?? record.datetime ?? '';
+
+/**
+ * @param {Record<string, string>} record
+ * @returns {string}
+ */
+const extractType = (record) =>
+  record.type ?? record.transaction_type ?? record.transactionType ?? '';
+
+/**
+ * @param {Record<string, string>} record
+ * @returns {string}
+ */
+const extractAsset = (record) =>
+  record.asset ?? record.currency ?? record.coin ?? '';
+
+/**
+ * @param {Record<string, string>} record
+ * @returns {string}
+ */
+const extractQuantity = (record) =>
+  record.quantity ?? record.amount ?? record.qty ?? '';
+
+// ---------------------------------------------------------------------------
+// Parsers and normalisers
+// ---------------------------------------------------------------------------
+
+/**
+ * Attempt to parse a raw value into a JS Date.
+ * Tries formats in order: unix ms, unix seconds, ISO/JS-parseable, DD/MM/YYYY, MM-DD-YYYY.
  *
  * @param {string} raw
- * @returns {Date|null}
+ * @returns {Date | null}
  */
 function parseTimestamp(raw) {
   if (!raw || String(raw).trim() === '') return null;
 
   const trimmed = String(raw).trim();
 
-  // Unix ms — pure numeric string
+  // Unix timestamps — pure numeric strings
   if (/^\d{10,13}$/.test(trimmed)) {
     const n = Number(trimmed);
-    // 10-digit = unix seconds, 13-digit = unix ms
-    const ms = trimmed.length === 10 ? n * 1000 : n;
+    const ms = trimmed.length <= 10 ? n * 1000 : n;
     const d = new Date(ms);
     if (!isNaN(d.getTime())) return d;
   }
 
-  // ISO 8601 / RFC 2822 / any JS-parseable string
-  const isoDate = new Date(trimmed);
-  if (!isNaN(isoDate.getTime())) return isoDate;
+  // ISO 8601 / RFC 2822 and any string JS Date can parse
+  const direct = new Date(trimmed);
+  if (!isNaN(direct.getTime())) return direct;
 
-  // DD/MM/YYYY
+  // DD/MM/YYYY  (e.g. 15/01/2024)
   const ddmmyyyy = trimmed.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
   if (ddmmyyyy) {
     const [, dd, mm, yyyy] = ddmmyyyy;
@@ -60,7 +114,7 @@ function parseTimestamp(raw) {
     if (!isNaN(d.getTime())) return d;
   }
 
-  // MM-DD-YYYY
+  // MM-DD-YYYY  (e.g. 01-15-2024)
   const mmddyyyy = trimmed.match(/^(\d{2})-(\d{2})-(\d{4})$/);
   if (mmddyyyy) {
     const [, mm, dd, yyyy] = mmddyyyy;
@@ -72,48 +126,53 @@ function parseTimestamp(raw) {
 }
 
 /**
- * Normalize an asset name to a canonical ticker symbol.
+ * Normalise an asset name to its canonical ticker symbol.
  *
  * @param {string} raw
- * @returns {{ asset: string|null, isUnknown: boolean }}
+ * @returns {{ asset: string | null, isUnknown: boolean }}
  */
-function normalizeAsset(raw) {
+function normaliseAsset(raw) {
   if (!raw || String(raw).trim() === '') {
     return { asset: null, isUnknown: true };
   }
 
   const trimmed = String(raw).trim();
-  const lower = trimmed.toLowerCase();
 
-  // Check alias map first
-  if (ASSET_ALIASES[lower]) {
-    return { asset: ASSET_ALIASES[lower], isUnknown: false };
-  }
+  // Full-name alias (e.g. "Bitcoin" → "BTC")
+  const alias = ASSET_ALIASES[trimmed.toLowerCase()];
+  if (alias) return { asset: alias, isUnknown: false };
 
-  // Check known tickers (case-insensitive)
+  // Already a known ticker
   const upper = trimmed.toUpperCase();
-  if (KNOWN_TICKERS.has(upper)) {
-    return { asset: upper, isUnknown: false };
-  }
+  if (KNOWN_TICKERS.has(upper)) return { asset: upper, isUnknown: false };
 
-  // Unknown — return uppercased value but flag it
+  // Unknown — store uppercased and flag
   return { asset: upper, isUnknown: true };
 }
 
+// ---------------------------------------------------------------------------
+// Main parser
+// ---------------------------------------------------------------------------
+
 /**
- * Parse a CSV file, normalize each row, flag bad data.
- * Bad rows are NOT dropped — they are returned with isValid=false
- * and a populated dataQualityFlags array.
+ * Parse a CSV file, normalise every field, and flag data quality issues.
  *
- * @param {string} filePath  - Absolute path to the CSV file
- * @param {string} source    - 'user' | 'exchange'
- * @returns {{ rows: object[], stats: { total: number, valid: number, flagged: number } }}
+ * Bad rows are NEVER dropped — they are returned with `isValid: false`
+ * and a populated `dataQualityFlags` array. This ensures every input row
+ * is accounted for in the final reconciliation report.
+ *
+ * @param {string} filePath  Absolute path to the CSV file
+ * @param {string} source    'user' | 'exchange'
+ * @returns {{
+ *   rows: import('../models/Transaction')[],
+ *   stats: { total: number, valid: number, flagged: number }
+ * }}
  */
 function parseCSV(filePath, source) {
-  const raw = fs.readFileSync(filePath, 'utf-8');
+  const rawCsv = fs.readFileSync(filePath, 'utf-8');
 
-  const records = parse(raw, {
-    columns: true,          // use first row as header
+  const records = parse(rawCsv, {
+    columns: true,
     skip_empty_lines: true,
     trim: true,
     relax_column_count: true,
@@ -125,43 +184,48 @@ function parseCSV(filePath, source) {
   for (const record of records) {
     const flags = [];
 
-    // --- txId ---
-    const rawTxId = record.txId || record.tx_id || record.transactionId || record.transaction_id || '';
+    // --- txId ---------------------------------------------------------------
+    const rawTxId = extractTxId(record);
     const txId = String(rawTxId).trim() || null;
     if (!txId) {
-      flags.push({ field: 'txId', issue: 'MISSING_TX_ID', value: String(rawTxId) });
+      flags.push({ field: 'txId', issue: DATA_QUALITY_ISSUE.MISSING_TX_ID, value: rawTxId });
     }
 
-    // --- timestamp ---
-    const rawTimestamp = record.timestamp || record.date || record.time || record.datetime || '';
+    // --- timestamp ----------------------------------------------------------
+    const rawTimestamp = extractTimestamp(record);
     const timestamp = parseTimestamp(rawTimestamp);
     if (!timestamp) {
-      flags.push({ field: 'timestamp', issue: 'UNPARSEABLE_TIMESTAMP', value: String(rawTimestamp) });
+      flags.push({
+        field: 'timestamp',
+        issue: DATA_QUALITY_ISSUE.UNPARSEABLE_TIMESTAMP,
+        value: String(rawTimestamp),
+      });
     }
 
-    // --- type ---
-    const rawType = record.type || record.transaction_type || record.transactionType || '';
+    // --- type ---------------------------------------------------------------
+    const rawType = extractType(record);
     const type = String(rawType).trim().toUpperCase() || null;
     if (!type) {
-      flags.push({ field: 'type', issue: 'MISSING_TYPE', value: String(rawType) });
+      flags.push({ field: 'type', issue: DATA_QUALITY_ISSUE.MISSING_TYPE, value: String(rawType) });
     }
 
-    // --- asset ---
-    const rawAsset = record.asset || record.currency || record.coin || '';
-    const { asset, isUnknown } = normalizeAsset(rawAsset);
+    // --- asset --------------------------------------------------------------
+    const rawAsset = extractAsset(record);
+    const { asset, isUnknown } = normaliseAsset(rawAsset);
     if (isUnknown) {
-      flags.push({ field: 'asset', issue: 'UNKNOWN_ASSET', value: String(rawAsset) });
+      flags.push({ field: 'asset', issue: DATA_QUALITY_ISSUE.UNKNOWN_ASSET, value: String(rawAsset) });
     }
 
-    // --- quantity ---
-    const rawQty = record.quantity || record.amount || record.qty || '';
+    // --- quantity -----------------------------------------------------------
+    const rawQty = extractQuantity(record);
     const quantity = parseFloat(String(rawQty).replace(/,/g, ''));
     if (isNaN(quantity)) {
-      flags.push({ field: 'quantity', issue: 'INVALID_QUANTITY', value: String(rawQty) });
+      flags.push({ field: 'quantity', issue: DATA_QUALITY_ISSUE.INVALID_QUANTITY, value: String(rawQty) });
     } else if (quantity < 0) {
-      flags.push({ field: 'quantity', issue: 'NEGATIVE_QUANTITY', value: String(rawQty) });
+      flags.push({ field: 'quantity', issue: DATA_QUALITY_ISSUE.NEGATIVE_QUANTITY, value: String(rawQty) });
     }
 
+    // --- assemble -----------------------------------------------------------
     const isValid = flags.length === 0;
     if (!isValid) flaggedCount++;
 
@@ -174,7 +238,6 @@ function parseCSV(filePath, source) {
       rawRow: { ...record },
       dataQualityFlags: flags,
       isValid,
-      source,
     });
   }
 
